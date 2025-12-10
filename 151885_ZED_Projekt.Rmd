@@ -1,0 +1,337 @@
+---
+title: "Analiza materiałów do superkondensatorów"
+subtitle: "Zaawansowana Eksploracja Danych - Projekt 1"
+author: "Szymon Skowroński"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+<style>
+body, h1, h2, h3, h4, h5, h6, .navbar {
+  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif !important;
+}
+</style>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10)
+```
+
+# 1. Podsumowanie zarządcze
+
+Celem projektu jest budowa modelu predykcyjnego pojemności właściwej superkondensatorów na podstawie parametrów strukturalnych i eksperymentalnych. Analiza zbioru danych wykazała nieliniowy wpływ powierzchni właściwej (SSA) na pojemność. Metody XAI zidentyfikowały zakres potencjału oraz zawartość azotu jako główne czynniki wpływające na wynik modelu. Algorytm Random Forest osiąga wysoką precyzję dla materiałów o dużej pojemności, przy niższej dokładności dla standardowych materiałów węglowych.
+
+---
+
+# 2. Biblioteki i konfiguracja środowiska
+
+Poniższy blok ładuje pakiety niezbędne do manipulacji danymi (`tidyverse`, `janitor`), wizualizacji (`ggplot2`, `plotly`), modelowania (`caret`, `randomForest`) oraz wyjaśnialności modelu (`DALEX`). Ustawiono również ziarno losowości (`set.seed`) dla zapewnienia powtarzalności wyników.
+
+```{r libraries}
+library(tidyverse)
+library(janitor)
+library(knitr)
+library(DT)
+library(plotly)
+library(corrplot)
+library(caret)
+library(randomForest)
+library(DALEX)
+library(skimr)
+
+set.seed(123)
+```
+
+---
+
+# 3. Wczytanie i czyszczenie danych
+
+Dane wczytano z pliku CSV, a nazwy kolumn zostały ustandaryzowane do formatu "snake_case". Tabela poniżej prezentuje podgląd surowych danych przed dalszym przetwarzaniem.
+
+```{r data_loading}
+df_raw <- read.csv("data.csv", stringsAsFactors = FALSE)
+
+df <- df_raw %>% clean_names()
+
+datatable(head(df, 10), options = list(scrollX = TRUE), caption = "Podgląd surowych danych")
+```
+
+## 3.1. Inżynieria cech
+
+W tym kroku wyrażenia regularne są stosowane aby przekonwertować tekstową kolumnę `limits_of_potential_window` na wartości szerokości okna (`potential_window_v`). Dodatkowo, rzadziej występujące elektrolity, czyli te spoza najczęstszej piątki, grupowane są do kategorii "Other", a kluczowe dla modelu kolumny są wybierane i konwertowane na odpowiednie typy danych.
+
+```{r feature_engineering}
+df_clean <- df %>%
+  mutate(
+    potential_range_str = as.character(limits_of_potential_window_v),
+    min_potential = as.numeric(str_extract(potential_range_str, "^-?[0-9.]+(?=\\s*to)")),
+    max_potential = as.numeric(str_extract(potential_range_str, "(?<=to\\s)-?[0-9.]+")),
+    calc_window = abs(max_potential - min_potential)
+  ) %>%
+  mutate(
+    potential_window_v = ifelse(is.na(potential_window_v), calc_window, potential_window_v),
+    electrolyte_type = fct_lump(electrolyte_chemical_formula, n = 5)
+  )
+
+df_model <- df_clean %>%
+  select(
+    capacitance_f_g,
+    current_density_a_g,
+    specific_surface_area_m_2_g,
+    potential_window_v,
+    pore_volume_cm_3_g,
+    n_at, c_at, o_at,
+    electrolyte_type
+  ) %>%
+  mutate(electrolyte_type = as.factor(electrolyte_type))
+```
+
+## 3.2. Obsługa braków danych
+
+Przyjęto strategię usuwania obserwacji, w których brakuje zmiennej celu (`capacitance_f_g`). Dla zmiennych predykcyjnych zastosowano imputację medianą, aby zachować jak najwięcej danych do treningu.
+
+```{r missing_values}
+df_model <- df_model %>% filter(!is.na(capacitance_f_g))
+
+pre_process_model <- preProcess(df_model, method = "medianImpute")
+df_final <- predict(pre_process_model, df_model)
+
+df_final <- na.omit(df_final)
+
+cat("Liczba obserwacji po czyszczeniu:", nrow(df_final))
+```
+
+---
+
+# 4. Analiza Eksploracyjna Danych
+
+## 4.1. Podsumowanie statystyczne i rozkłady
+
+Poniższa tabela przedstawia statystyki opisowe zmiennych. Następnie generowane są histogramy dla wszystkich zmiennych numerycznych przy użyciu transformacji danych do formatu długiego (`pivot_longer`) i niezależnych skal (`scales = "free"`), co pozwala na ocenę skośności rozkładów.
+
+```{r distribution_analysis, fig.height=8}
+summary(df_final) %>%
+  kable(caption = "Statystyki opisowe dla zmiennych w modelu")
+
+df_final %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "Zmienna", values_to = "Wartosc") %>%
+  ggplot(aes(x = Wartosc)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  facet_wrap(~Zmienna, scales = "free") +
+  theme_minimal() +
+  labs(title = "Rozkłady zmiennych numerycznych",
+       x = "Wartość",
+       y = "Liczebność")
+```
+
+Wartości odchylenia standardowego oraz różnice między średnią a medianą wskazują na zróżnicowanie danych.
+
+Parametry `current_density_a_g` oraz `specific_surface_area` wykazują rozkłady prawoskośne. Algorytm Random Forest nie wymaga normalności rozkładu zmiennych, co umożliwia bezpośrednie wykorzystanie tych danych w modelowaniu bez transformacji logarytmicznej.
+
+## 4.2. Macierz korelacji
+
+Analiza współzależności ogranicza się do zmiennych numerycznych. Wykres `corrplot` wizualizuje siłę i kierunek korelacji.
+
+```{r correlation, fig.height=8}
+nums <- unlist(lapply(df_final, is.numeric))
+cor_matrix <- cor(df_final[, nums])
+
+corrplot(cor_matrix, 
+         method = "color", 
+         type = "upper", 
+         order = "hclust",
+         addCoef.col = "black",
+         tl.col = "black", 
+         tl.srt = 45,
+         number.cex = 0.7,
+         title = "Macierz korelacji parametrów", 
+         mar = c(0,0,1,0))
+```
+
+1. Występuje korelacja między `specific_surface_area` a `pore_volume`, co jest fizycznie uzasadnione (więcej porów = większa powierzchnia).
+
+2. Umiarkowana korealcja dodatnia wystepuje między `specific_surface_area` i `potential_window_v`. Materiały o większej powierzchni są często bardziej stabilne elektrochemicznie, co pozwala na testowanie ich w szerszym zakresie napięć.
+
+3. Bardzo silna korelacja ujemna zachodzi między `c_at` oraz `o_at`. Jest to uzasadnione, ponieważ wskutek domieszkowania zawartość tlenu musi oznaczać spadek zawartości węgla.
+
+4. Problemy współliniowości impikowane przez wysokie poziomy korelacji (>0.8) są skutecznie mitygowane w predykcji przez zastosowanie algorytmu Random Forest.
+
+## 4.3. Analiza wpływu elektrolitu
+
+Wykres pudełkowy ilustruje rozkład pojemności w podziale na typ użytego elektrolitu, co pozwala ocenić wpływ środowiska chemicznego na wydajność.
+
+```{r boxplot_electrolyte}
+ggplot(df_final, aes(x = electrolyte_type, y = capacitance_f_g, fill = electrolyte_type)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "Rozkład pojemności w zależności od użytego elektrolitu",
+       x = "Typ elektrolitu",
+       y = "Pojemność (F/g)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+```
+
+Wykres pudełkowy przedstawia wydajność materiałów w różnych środowiskach chemicznych. Mediana pojemności zmienia się w zależności od zastosowanego elektrolitu. Roztwory zasadowe (NaOH, KOH) osiągają najwyższe wartości. NaOH charakteryzuje się najwyższą medianą w badanej grupie. Rozkład dla KOH obejmuje wartości odstające przekraczające 3000 F/g, przy przeciętnej wydajności niższej niż w przypadku NaOH. Elektrolity Na2SO4 i KNO3 wykazują mniejszą wariancję oraz niższe mediany pojemności.
+
+## 4.4. Interaktywna wizualizacja 3D
+
+Interaktywny wykres punktowy 3D bada relację między powierzchnią właściwą, gęstością prądu a pojemnością, z uwzględnieniem typu elektrolitu.
+
+```{r plotly_3d}
+plot_ly(df_final, 
+        x = ~specific_surface_area_m_2_g, 
+        y = ~current_density_a_g, 
+        z = ~capacitance_f_g, 
+        color = ~electrolyte_type, 
+        type = 'scatter3d', 
+        mode = 'markers',
+        marker = list(size = 4, opacity = 0.8)) %>%
+  layout(title = "Relacja: SSA vs Gęstość prądu vs Pojemność",
+         scene = list(xaxis = list(title = 'SSA (m2/g)'),
+                      yaxis = list(title = 'Current Density (A/g)'),
+                      zaxis = list(title = 'Capacitance (F/g)')))
+```
+
+Najwyższe wartości pojemności (>2000 F/g) występują wyłącznie w zakresie niskich gęstości prądu (<10 A/g). Wzrost obciążenia prądowego powoduje drastyczny spadek dostępnej pojemności dla wszystkich badanych materiałów, co wskazuje na ograniczenia kinetyczne procesów magazynowania energii przy szybkim ładowaniu/rozładowaniu.
+
+Wbrew intuicyjnemu założeniu, najwyższe pojemności nie korelują liniowo z maksymalnym rozwinięciem powierzchni. Rekordowe wyniki odnotowano dla materiałów o umiarkowanym SSA (poniżej 1200 m²/g). Wzrost SSA powyżej tej wartości nie przekłada się na proporcjonalny przyrost pojemności, co jest spójne z obserwowanym wcześniej efektem nasycenia na wykresie PDP i może wynikać z nieefektywnej struktury porów.
+
+Wodorotlenek potasu KOH dominuje w grupie wyników o najwyższej pojemności. Użycie tego elektrolitu pozwala na osiągnięcie wartości skrajnych, niedostępnych dla roztworów obojętnych Na2SO4 czy kwasowych H2SO4, choć wiąże się to z dużą wariancją wyników.
+
+---
+
+# 5. Modelowanie predykcyjne
+
+Dane zostały podzielone na zbiór treningowy (80%) i testowy (20%) przy użyciu funkcji `createDataPartition.` Trenowanie modelu Random Forest odbyło się z wykorzystaniem 5-krotnej walidacji krzyżowej oraz parametru `ntree = 500`.
+
+```{r modeling}
+trainIndex <- createDataPartition(df_final$capacitance_f_g, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+dataTrain <- df_final[ trainIndex,]
+dataTest  <- df_final[-trainIndex,]
+
+ctrl <- trainControl(method = "cv", number = 5)
+
+model_rf <- randomForest(capacitance_f_g ~ ., 
+                         data = dataTrain, 
+                         importance = TRUE, 
+                         ntree = 500)
+
+print(model_rf)
+```
+
+## 5.1. Ewaluacja modelu
+
+Jakość modelu oceniono na zbiorze testowym przy użyciu metryk RMSE i $R^2$. Wykres punktowy zestawia wartości rzeczywiste z przewidywanymi, gdzie linia przerywana oznacza idealne dopasowanie.
+
+```{r evaluation}
+predictions <- predict(model_rf, dataTest)
+
+metrics <- postResample(pred = predictions, obs = dataTest$capacitance_f_g)
+kable(metrics, col.names = "Wartość", caption = "Metryki oceny modelu na zbiorze testowym")
+
+data.frame(Observed = dataTest$capacitance_f_g, Predicted = predictions) %>%
+  ggplot(aes(x = Observed, y = Predicted)) +
+  geom_point(alpha = 0.5, color = "blue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Wykres Rzeczywiste vs Przewidywane wartości",
+       x = "Rzeczywista Pojemność", y = "Przewidywana Pojemność")
+```
+
+Błąd średniokwadratowy wynosi `r round(metrics['RMSE'], 2)`. Przy predykcji materiałów o wysokiej pojemności (>2000 F/g) błąd względny oscyluje w granicach 15%. W przypadku materiałów o niskiej pojemności (ok. 150 F/g) błąd bezwzględny przewyższa wartość mierzoną, co ogranicza stosowalność modelu w tym zakresie.
+
+---
+
+# 6. Wyjaśnialna Sztuczna Inteligencja (XAI)
+
+W tej sekcji utworzono obiekt wyjaśniający z pakietu DALEX, który posłuży do interpretacji decyzji modelu "Black Box".
+
+```{r explainer}
+explainer_rf <- explain(model_rf, 
+                        data = dataTest %>% select(-capacitance_f_g), 
+                        y = dataTest$capacitance_f_g, 
+                        label = "Random Forest",
+                        verbose = FALSE)
+```
+
+## 6.1. Permutacyjna ważność cech
+
+Wykres przedstawia globalną ważność cech, mierzoną jako wzrost błędu RMSE po losowym wymieszaniu wartości danej zmiennej.
+
+```{r feature_importance}
+fi_rf <- model_parts(explainer_rf, loss_function = loss_root_mean_square)
+plot(fi_rf) + labs(title = "Ważność cech (Feature Importance)", subtitle = "O ile wzrośnie RMSE po wymieszaniu danej zmiennej?")
+```
+
+Liderem wyłonionym w analizie zostało okno potencjału. Jest to wniosek przeciwny do tego otrzymanego w wyniku analizy korelacji, która była umiarkowana dla okna potencjału i pojemności i wyniosła `-0.34` . Oznacza to, że relacja między oknem napięciowym a pojemnością jest silnie nieliniowa.
+
+Drugą najważniejszą cechą jest zawartość azotu, co potwierdza teorię o pseudopojemności. Domieszkowanie azotem drastycznie zmienia właściwości elektrochemiczne węgla, zwiększając pojemność.
+
+Trzecie miejsce zajmuje typ elektrolitu. Jest to spójne z wykresem pudełkowym, który pokazał różnice między KOH a innymi elektrolitami. 
+
+Zgodnie z korelacją na poziomie `0.00`, gęstość prądu jest najmniej istotną cechą dla modelu Random Forest.
+
+## 6.2. Analiza SHAP
+
+Wykres SHAP prezentuje lokalną interpretację dla pojedynczej obserwacji (materiału o najwyższej pojemności w zbiorze testowym), pokazując wkład poszczególnych cech w końcową predykcję.
+
+```{r shap}
+new_observation <- dataTest[which.max(dataTest$capacitance_f_g), ]
+
+shap_values <- predict_parts(explainer_rf, 
+                             new_observation = new_observation, 
+                             type = "shap")
+
+plot(shap_values) + 
+  labs(title = "Wartości SHAP dla materiału o najwyższej pojemności",
+       subtitle = "Kontrybucja cech do predykcji (dodatnia/ujemna)")
+```
+
+Największą rolę odgrywa `potential_window_v = 0.5`, co wskazuje, że to właśnie ta cecha najbardziej przyczyniła się do wysokiej predykcji. Jest to charakterystyczne dla systemów pseudopojemnościowych w elektrolitach wodnych, które oferują ogromną pojemność kosztem niższego napięcia.
+
+Drugim kluczowym czynnikiem sukcesu jest użycie wodorotlenku potasu (`electrolyte_type = KOH`), co potwierdza wcześniejsze obserwacje z analizy EDA.
+
+Brak azotu (`n_at = 0`) w strukturze obniżył potencjał tego materiału. Stąd wniosek, że gdyby ten konkretny materiał został dodatkowo domieszkowany azotem, jego wynik mógłby być jeszcze wyższy. Jest to spójne z analizą permutacyjnej ważności cech, która nadała występowaniu azotu wysoką wartość.
+
+## 6.3. Profile Zależności Cząstkowej (PDP)
+
+Krzywa PDP obrazuje średnią zmianę predykcji modelu w funkcji zmieniającej się powierzchni właściwej (SSA).
+
+```{r pdp}
+pdp_ssa <- model_profile(explainer_rf, variables = "specific_surface_area_m_2_g")
+
+plot(pdp_ssa) +
+  labs(
+    title = "Partial Dependence Plot dla Powierzchni Właściwej (SSA)",
+    subtitle = NULL,
+    x = "Powierzchnia właściwa [m^2/g]",
+    y = "Średnia predykcja pojemności"
+  )
+```
+
+Krzywa PDP przedstawia nieliniową zależność pojemności od powierzchni właściwej (SSA). Wzrost wartości SSA początkowo skutkuje zwiększeniem pojemności, a następnie prowadzi do stabilizacji wyniku. Wypłaszczenie krzywej wskazuje na efekt nasycenia. Dalszy przyrost powierzchni nie zwiększa efektywności procesu ze względu na ograniczenia w dostępności porów dla jonów elektrolitu.
+
+# 7. Weryfikacja zależności w świetle literatury przedmiotu
+
+Wyniki otrzymane w analizie zestawiono z innymi odkryciami z dziedziny.
+
+## 7.1 Korelacja powierzchni właściwej i pojemności
+
+Literatura naukowa potwierdza nieliniową zależność między powierzchnią właściwą (SSA) a pojemnością elektryczną materiałów węglowych. Początkowy liniowy wzrost pojemności ulega zahamowaniu po przekroczeniu określonej wartości SSA [1]. Zjawisko to wynika z efektu dopasowania wielkości porów do średnicy solwatowanych jonów elektrolitu. Pory o średnicy mniejszej niż otoczka solwatacyjna jonu stają się niedostępne dla procesu formowania podwójnej warstwy elektrycznej, co tłumaczy obserwowane na wykresie PDP wypłaszczenie krzywej i efekt nasycenia [2].
+
+## 7.2 Wpływ środowiska chemicznego na wydajność
+
+Wyższa wydajność elektrolitów zasadowych (NaOH, KOH) w porównaniu do soli obojętnych (Na2SO4) wynika z różnic w przewodności jonowej i promieniach hydratacyjnych. Jony w roztworach alkalicznych charakteryzują się wyższą ruchliwością, co ułatwia penetrację struktury porowatej elektrody [3]. W środowisku alkalicznym na powierzchni materiałów węglowych zachodzą ponadto odwracalne reakcje redoks z udziałem grup funkcyjnych tlenowych, co zwiększa mierzoną pojemność układu w porównaniu do mechanizmu czysto elektrostatycznego [4].
+
+## 7.3 Analiza wartości skrajnych w roztworach alkalicznych
+
+Wartości odstające przekraczające 3000 F/g dla elektrolitu KOH wykraczają poza teoretyczne limity dla mechanizmu opartego na warstwie podwójnej, szacowane poniżej 500 F/g dla materiałów węglowych [1][5]. Wyniki tego rzędu wiążą się z dominującym udziałem pseudopojemności faradajowskiej [6]. Wskazuje to na obecność domieszek tlenków metali przejściowych lub polimerów przewodzących, wykazujących wzmożoną aktywność redoks w roztworach KOH.
+
+---
+
+Źródła: [1] Simon P., Gogotsi Y., Materials for electrochemical capacitors, Nature Materials 7, 845–854 (2008). [2] Largeot C. et al., Relation between the ion size and pore size for an electric double-layer capacitor, Journal of the American Chemical Society 130, 2730–2731 (2008). [3] Zhong C. et al., Electrolyte for electrochemical supercapacitors, Chemical Society Reviews 44, 7484-7539 (2015). [4] Frackowiak E., Béguin F., Carbon materials for the electrochemical storage of energy in capacitors, Carbon 39, 937-950 (2001). [5] Barbieri O. et al., Capacitance limits of high surface area activated carbons for double layer capacitors, Carbon 43, 1303–1310 (2005). [6] Conway B.E., Electrochemical Supercapacitors: Scientific Fundamentals and Technological Applications, Kluwer Academic/Plenum Publishers (1999).
